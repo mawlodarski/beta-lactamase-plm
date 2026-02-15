@@ -1,0 +1,10 @@
+
+# model artifacts
+models/*.keras
+*.keras
+models/*.h5
+*.h5
+models/*.pt
+*.pt
+models/*.pth
+*.pth
