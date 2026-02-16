@@ -1,0 +1,1 @@
+hmmsearch --cpu 32 -E 1e-10 --tblout discovery/gt60.tbl discovery/discovery_bl.hmm gt60.faa > discovery/gt60.txt
