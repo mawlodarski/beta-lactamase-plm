@@ -409,6 +409,150 @@ class TransformerAmblerModel(Model):
         return cls(**filtered)
 
 # -----------------------------
+# Enzyme-type Transformer model (Serine vs Metallo)
+# -----------------------------
+
+class TransformerEnzymeModel(Model):
+    """
+    Transformer-based enzyme-type classifier (Serine vs Metallo).
+
+    The model predicts Enzyme_type of a protein sequence using a CLS
+    sequence embedding.
+
+    Interpretability:
+      - `return_attn=True` returns per-layer attention score tensors (B, heads, L, L)
+      - `return_embedding=True` returns the CLS embedding vector (B, D) for UMAP
+    """
+    def __init__(self,
+                vocab_size,
+                n_enzyme_classes,
+                emb_dim,
+                num_heads,
+                ff_dim,
+                max_len,
+                num_layers,
+                dropout=0.1,
+                name="enzyme_classifier",
+                **kwargs):
+        super().__init__(name=name, **kwargs)
+
+        self.vocab_size = vocab_size
+        self.n_enzyme_classes = n_enzyme_classes
+        self.emb_dim = emb_dim
+        self.num_heads = num_heads
+        self.ff_dim = ff_dim
+        self.max_len = max_len
+        self.max_len_with_cls = max_len + 1
+        self.num_layers = num_layers
+        self.dropout = dropout
+
+        # Shared embedding + positional add + mask
+        self.tok_embed = Embedding(vocab_size, emb_dim, name="tok_embed")
+        self.pos_add = PositionalAdder(self.max_len_with_cls, emb_dim, name="pos_add")
+        self.mask_layer = AttnMaskExpand(name="attn_mask")
+
+        # Shared encoder stack
+        self.encoders = [
+            Encoder(emb_dim, num_heads, ff_dim, dropout=dropout, name=f"encoder_{i}")
+            for i in range(num_layers)
+        ]
+
+        # Enzyme head
+        self.head_dense = Dense(256, activation="relu", name="head_dense")
+        self.head_drop = Dropout(dropout, name="head_dropout")
+        self.enzyme_out = Dense(n_enzyme_classes, activation="softmax", name="enzyme_output")
+
+    def build(self, input_shape):
+        dummy_tokens = tf.zeros((1, self.max_len), dtype=tf.int32)
+        _ = self.call(dummy_tokens, training=False, return_attn=False, return_embedding=False)
+        super().build(input_shape)
+
+    @staticmethod
+    def _prepend_cls(tokens):
+        """
+        Prepend CLS token to a batch of token ids.
+        tokens: (B, L) -> (B, L+1)
+        """
+        B = tf.shape(tokens)[0]
+        cls_col = tf.fill([B, 1], tf.cast(CLS_ID, tf.int32))
+        tokens = tf.cast(tokens, tf.int32)
+        return tf.concat([cls_col, tokens], axis=1)
+
+    def call(self, tokens, training=False, return_attn=False, return_embedding=False):
+        """
+        tokens: (B, max_len) int32 token ids (padded/truncated), should include EOS.
+        """
+        tokens_cls = self._prepend_cls(tokens)                   # (B, L+1)
+        mask = tf.not_equal(tokens_cls, PAD)[:, tf.newaxis, :]   # (B, 1, L+1)
+
+        tok = self.tok_embed(tokens_cls)                         # (B, L+1, D)
+        x = self.pos_add(tokens_cls, tok)                        # (B, L+1, D)
+
+        attentions = [] if return_attn else None
+
+        for enc in self.encoders:
+            if return_attn:
+                x, attn = enc(x, mask=mask, training=training, return_attn=True)
+                attentions.append(attn)
+            else:
+                x = enc(x, mask=mask, training=training, return_attn=False)
+
+        cls_emb = x[:, 0, :]                                     # (B, D)
+
+        h = self.head_dense(cls_emb)
+        h = self.head_drop(h, training=training)
+        y = self.enzyme_out(h)                                   # (B, n_enzyme_classes)
+
+        out = {"enzyme_output": y}
+
+        if return_embedding:
+            out["embedding"] = cls_emb
+
+        if return_attn:
+            out["attn"] = attentions
+
+        return out
+
+    def get_sequence_embedding(self, tokens, batch_size=256):
+        """
+        Extract CLS embeddings for UMAP.
+        tokens: (N, max_len)
+        returns: (N, emb_dim)
+        """
+        ds = tf.data.Dataset.from_tensor_slices(tokens).batch(batch_size)
+        embs = []
+        for batch in ds:
+            out = self(batch, training=False, return_attn=False, return_embedding=True)
+            embs.append(out["embedding"])
+        return tf.concat(embs, axis=0).numpy()
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "vocab_size": self.vocab_size,
+            "n_enzyme_classes": self.n_enzyme_classes,
+            "emb_dim": self.emb_dim,
+            "num_heads": self.num_heads,
+            "ff_dim": self.ff_dim,
+            "max_len": self.max_len,
+            "num_layers": self.num_layers,
+            "dropout": self.dropout,
+            "name": self.name,
+        })
+        return cfg
+
+    @classmethod
+    def from_config(cls, config):
+        allowed = {
+            "vocab_size", "n_enzyme_classes",
+            "emb_dim", "num_heads", "ff_dim",
+            "max_len", "num_layers", "dropout", "name"
+        }
+        filtered = {k: v for k, v in config.items() if k in allowed}
+        return cls(**filtered)
+
+
+# -----------------------------
 # Family Transformer model
 # -----------------------------
 
